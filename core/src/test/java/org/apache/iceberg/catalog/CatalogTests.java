@@ -30,14 +30,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.FilesTable;
 import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.HistoryEntry;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.ReachableFileUtil;
 import org.apache.iceberg.ReplaceSortOrder;
@@ -46,6 +50,7 @@ import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.TestHelpers;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.UpdatePartitionSpec;
@@ -56,6 +61,10 @@ import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.metrics.CommitReport;
+import org.apache.iceberg.metrics.MetricsReport;
+import org.apache.iceberg.metrics.MetricsReporter;
+import org.apache.iceberg.metrics.ScanReport;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -143,6 +152,8 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
           .build();
 
   protected abstract C catalog();
+
+  protected abstract C initCatalog(String catalogName, Map<String, String> additionalProperties);
 
   protected boolean supportsNamespaceProperties() {
     return true;
@@ -1273,9 +1284,7 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
             .withPartitionSpec(SPEC)
             .withProperty("format-version", "2")
             .create();
-    assertThat(((BaseTable) table).operations().current().formatVersion())
-        .as("Should be a v2 table")
-        .isEqualTo(2);
+    assertThat(TableUtil.formatVersion(table)).as("Should be a v2 table").isEqualTo(2);
 
     table.updateSpec().addField("id").commit();
 
@@ -2144,6 +2153,39 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
   }
 
   @Test
+  public void testReplaceTableKeepsSnapshotLog() {
+    C catalog = catalog();
+
+    if (requiresNamespaceCreate()) {
+      catalog.createNamespace(TABLE.namespace());
+    }
+
+    catalog.createTable(TABLE, SCHEMA);
+
+    Table table = catalog.loadTable(TABLE);
+    table.newAppend().appendFile(FILE_A).commit();
+
+    List<HistoryEntry> snapshotLogBeforeReplace =
+        ((BaseTable) table).operations().current().snapshotLog();
+    assertThat(snapshotLogBeforeReplace).hasSize(1);
+    HistoryEntry snapshotBeforeReplace = snapshotLogBeforeReplace.get(0);
+
+    Transaction replaceTableTransaction = catalog.newReplaceTableTransaction(TABLE, SCHEMA, false);
+    replaceTableTransaction.newAppend().appendFile(FILE_A).commit();
+    replaceTableTransaction.commitTransaction();
+    table.refresh();
+
+    List<HistoryEntry> snapshotLogAfterReplace =
+        ((BaseTable) table).operations().current().snapshotLog();
+    HistoryEntry snapshotAfterReplace = snapshotLogAfterReplace.get(1);
+
+    assertThat(snapshotAfterReplace).isNotEqualTo(snapshotBeforeReplace);
+    assertThat(snapshotLogAfterReplace)
+        .hasSize(2)
+        .containsExactly(snapshotBeforeReplace, snapshotAfterReplace);
+  }
+
+  @Test
   public void testConcurrentReplaceTransactions() {
     C catalog = catalog();
 
@@ -2510,7 +2552,7 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
   }
 
   @ParameterizedTest
-  @ValueSource(ints = {1, 2})
+  @ValueSource(ints = {1, 2, 3})
   public void createTableTransaction(int formatVersion) {
     if (requiresNamespaceCreate()) {
       catalog().createNamespace(NS);
@@ -2524,8 +2566,7 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
             ImmutableMap.of("format-version", String.valueOf(formatVersion)))
         .commitTransaction();
 
-    BaseTable table = (BaseTable) catalog().loadTable(TABLE);
-    assertThat(table.operations().current().formatVersion()).isEqualTo(formatVersion);
+    assertThat(TableUtil.formatVersion(catalog().loadTable(TABLE))).isEqualTo(formatVersion);
   }
 
   @ParameterizedTest
@@ -2695,6 +2736,87 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
     assertThat(catalog.dropTable(identifier)).isTrue();
   }
 
+  @Test
+  public void testCatalogWithCustomMetricsReporter() throws IOException {
+    C catalogWithCustomReporter =
+        initCatalog(
+            "catalog_with_custom_reporter",
+            ImmutableMap.of(
+                CatalogProperties.METRICS_REPORTER_IMPL, CustomMetricsReporter.class.getName()));
+
+    if (requiresNamespaceCreate()) {
+      catalogWithCustomReporter.createNamespace(TABLE.namespace());
+    }
+
+    catalogWithCustomReporter.buildTable(TABLE, SCHEMA).create();
+
+    Table table = catalogWithCustomReporter.loadTable(TABLE);
+    DataFile dataFile =
+        DataFiles.builder(PartitionSpec.unpartitioned())
+            .withPath(FileFormat.PARQUET.addExtension(UUID.randomUUID().toString()))
+            .withFileSizeInBytes(10)
+            .withRecordCount(2)
+            .build();
+
+    // append file through FastAppend and check and reset counter
+    table.newFastAppend().appendFile(dataFile).commit();
+    assertThat(CustomMetricsReporter.COMMIT_COUNTER.get()).isEqualTo(1);
+    CustomMetricsReporter.COMMIT_COUNTER.set(0);
+
+    TableIdentifier identifier = TableIdentifier.of(NS, "custom_metrics_reporter_table");
+    // append file through createTransaction() and check and reset counter
+    catalogWithCustomReporter
+        .buildTable(identifier, SCHEMA)
+        .createTransaction()
+        .newFastAppend()
+        .appendFile(dataFile)
+        .commit();
+    assertThat(CustomMetricsReporter.COMMIT_COUNTER.get()).isEqualTo(1);
+    CustomMetricsReporter.COMMIT_COUNTER.set(0);
+
+    // append file through createOrReplaceTransaction() and check and reset counter
+    catalogWithCustomReporter
+        .buildTable(identifier, SCHEMA)
+        .createOrReplaceTransaction()
+        .newFastAppend()
+        .appendFile(dataFile)
+        .commit();
+    assertThat(CustomMetricsReporter.COMMIT_COUNTER.get()).isEqualTo(1);
+    CustomMetricsReporter.COMMIT_COUNTER.set(0);
+
+    // append file through replaceTransaction() and check and reset counter
+    catalogWithCustomReporter
+        .buildTable(TABLE, SCHEMA)
+        .replaceTransaction()
+        .newFastAppend()
+        .appendFile(dataFile)
+        .commit();
+    assertThat(CustomMetricsReporter.COMMIT_COUNTER.get()).isEqualTo(1);
+    CustomMetricsReporter.COMMIT_COUNTER.set(0);
+
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      assertThat(tasks.iterator()).hasNext();
+    }
+
+    assertThat(CustomMetricsReporter.SCAN_COUNTER.get()).isEqualTo(1);
+    // reset counter in case subclasses run this test multiple times
+    CustomMetricsReporter.SCAN_COUNTER.set(0);
+  }
+
+  public static class CustomMetricsReporter implements MetricsReporter {
+    static final AtomicInteger SCAN_COUNTER = new AtomicInteger(0);
+    static final AtomicInteger COMMIT_COUNTER = new AtomicInteger(0);
+
+    @Override
+    public void report(MetricsReport report) {
+      if (report instanceof ScanReport) {
+        SCAN_COUNTER.incrementAndGet();
+      } else if (report instanceof CommitReport) {
+        COMMIT_COUNTER.incrementAndGet();
+      }
+    }
+  }
+
   private static void assertEmpty(String context, Catalog catalog, Namespace ns) {
     try {
       assertThat(catalog.listTables(ns)).as(context).isEmpty();
@@ -2729,12 +2851,13 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
       List<CharSequence> paths =
           Streams.stream(tasks)
               .map(FileScanTask::file)
-              .map(DataFile::path)
+              .map(DataFile::location)
               .collect(Collectors.toList());
       assertThat(paths).as("Should contain expected number of data files").hasSize(files.length);
       assertThat(CharSequenceSet.of(paths))
           .as("Should contain correct file paths")
-          .isEqualTo(CharSequenceSet.of(Iterables.transform(Arrays.asList(files), DataFile::path)));
+          .isEqualTo(
+              CharSequenceSet.of(Iterables.transform(Arrays.asList(files), DataFile::location)));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -2744,7 +2867,7 @@ public abstract class CatalogTests<C extends Catalog & SupportsNamespaces> {
     try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
       Streams.stream(tasks)
           .map(FileScanTask::file)
-          .filter(file -> file.path().equals(dataFile.path()))
+          .filter(file -> file.location().equals(dataFile.location()))
           .forEach(file -> assertThat(file.specId()).as("Spec ID should match").isEqualTo(specId));
     } catch (IOException e) {
       throw new UncheckedIOException(e);
